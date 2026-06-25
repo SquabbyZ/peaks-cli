@@ -1,17 +1,26 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { dirname, resolve as resolvePath } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { readText } from '../../shared/fs.js';
 import { requiredSchemaFiles, requiredSkillNames, schemasDir } from '../../shared/paths.js';
 import { getErrorMessage } from '../../shared/result.js';
 import { loadSkillRegistry } from '../skills/skill-registry.js';
 import { getSkillPresence, type SkillPresence } from '../skills/skill-presence-service.js';
-import { planStatusLineInstall } from '../skills/statusline-settings-service.js';
 import { findProjectRoot } from '../config/config-safety.js';
 import { isValidSessionId } from '../workspace/sid-naming-guard.js';
 import { CLI_VERSION } from '../../shared/version.js';
+import {
+  defaultCodegraphProbe,
+  defaultStatusLineInstalledProbe,
+  defaultWorkspaceInitializedProbe,
+  defaultDistVersionProbe,
+  defaultWorkspaceLayoutProbe,
+  type CodegraphCapabilityProbe,
+  type DistVersionProbe,
+  type WorkspaceLayoutProbe
+} from './doctor-probes.js';
+import { defaultGateguardProbe, collectGateguardEntries, entrySkipsPeaks, type GateguardProbe } from './doctor-gateguard.js';
+import { extractRunbookSection, findDestructiveApplyLines, AUTHORIZATION_KEYWORDS_PATTERN } from './doctor-runbook.js';
 
 export type DoctorCheck = {
   id: string;
@@ -27,80 +36,6 @@ export type DoctorReport = {
     failed: number;
   };
 };
-
-export type CodegraphCapabilityProbe = {
-  packagePath: string;
-  version: string;
-  binaryPath: string;
-  binaryExists: boolean;
-};
-
-export type DistVersionComparison = {
-  dist: string | null;
-  source: string;
-  match: boolean;
-  distReadable: boolean;
-};
-
-export type DistVersionProbe = () => DistVersionComparison;
-
-export type WorkspaceLayoutInspection = {
-  topLevelSessionDirs: string[];
-  legacyDotfiles: string[];
-  /**
-   * Slice 007 — per-change-id top-level dirs (e.g. `.peaks/001-2026-06-06-.../`).
-   * The pre-F3 canonical layout put reviewable artifacts under a
-   * per-change-id top-level dir; the post-F3 canonical layout
-   * consolidates them under `.peaks/_runtime/<sid>/<role>/`. Any
-   * leftover per-change-id top-level dir is a regression to flag.
-   * Slice 008's migration will consolidate these; until then, the
-   * check reports them as `ok: false`.
-   *
-   * Optional in the type for back-compat with test probes that
-   * pre-date the slice 007 broadening; the check itself falls back
-   * to an empty array when the field is missing.
-   */
-  perChangeIdDirs?: string[];
-};
-
-export type WorkspaceLayoutProbe = () => WorkspaceLayoutInspection;
-
-/**
- * 2026-06-10 — `gateguard-fact-force` (a third-party PreToolUse hook,
- * NOT peaks-cli) fires on Edit / Write and demands a 4-fact questionnaire
- * before allowing the edit. When the LLM is in a peaks-qa flow and tries
- * to update `.peaks/_runtime/<sid>/qa/requests/*.md` via the Edit/Write
- * tool, the hook demands facts that are inapplicable to QA envelope
- * templates (no importers, no public API, no data files, user
- * instruction already in the conversation context). The check detects
- * this hook in the user's global and project `.claude/settings.json` and
- * warns when no `.peaks/**` skip is configured. The probe is injected so
- * tests do not depend on the real `~/.claude/settings.json` state.
- */
-export type GateguardHookLocation = {
-  /** Source file the hook was discovered in (`global` or `project .claude/settings.json`). */
-  source: 'global' | 'project';
-  /** Resolved absolute path to the source file (for the message). */
-  sourcePath: string;
-  /** The PreToolUse entry that contains a gateguard hook command. */
-  entry: {
-    matcher?: string;
-    hooks: ReadonlyArray<{ type?: string; command?: string }>;
-  };
-};
-
-export type GateguardProbeResult = {
-  /** Absolute path to `~/.claude/settings.json` (or null when the probe could not resolve it). */
-  globalSettingsPath: string | null;
-  /** Parsed global settings payload (or null when missing / unreadable / malformed). */
-  globalSettings: unknown;
-  /** Absolute path to the project `.claude/settings.json` (or null when the project root is not in a peaks project). */
-  projectSettingsPath: string | null;
-  /** Parsed project settings payload (or null when missing / unreadable / malformed). */
-  projectSettings: unknown;
-};
-
-export type GateguardProbe = () => GateguardProbeResult;
 
 export type DoctorOptions = {
   schemasBaseDir?: string;
@@ -130,402 +65,6 @@ export type DoctorOptions = {
 
 const CODEGRAPH_EXPECTED_VERSION = '0.7.10';
 const SKILL_PRESENCE_FRESHNESS_THRESHOLD_MS = 24 * 60 * 60 * 1000;
-
-function defaultCodegraphProbe(): CodegraphCapabilityProbe {
-  const require = createRequire(import.meta.url);
-  const packagePath = require.resolve('@colbymchenry/codegraph/package.json');
-  const pkg = require(packagePath) as { version?: string };
-  const binaryPath = resolvePath(dirname(packagePath), 'dist', 'bin', 'codegraph.js');
-  return {
-    packagePath,
-    version: pkg.version ?? 'unknown',
-    binaryPath,
-    binaryExists: existsSync(binaryPath)
-  };
-}
-
-function defaultStatusLineInstalledProbe(): boolean {
-  const projectRoot = findProjectRoot(process.cwd());
-  // Check both scopes: a user may have installed the statusLine globally, which
-  // the project-only check would miss and falsely report as "not installed".
-  try {
-    if (projectRoot !== null && planStatusLineInstall('project', projectRoot).alreadyInstalled) {
-      return true;
-    }
-  } catch {
-    /* fall through to global */
-  }
-  try {
-    return planStatusLineInstall('global').alreadyInstalled;
-  } catch {
-    return false;
-  }
-}
-
-function defaultWorkspaceInitializedProbe(): boolean {
-  const projectRoot = findProjectRoot(process.cwd());
-  if (projectRoot === null) return false;
-  // Workspace is "initialized" when EITHER the canonical runtime-layer session
-  // binding (`.peaks/_runtime/session.json`, the home since slice
-  // 2026-06-05-peaks-runtime-layer) OR the legacy top-level binding
-  // (`.peaks/.session.json`, kept as read-only back-compat for one minor
-  // release) is present. The legacy check is what catches projects that ran
-  // `peaks workspace init` before the runtime-layer migration and have not yet
-  // been reconciled; both paths must continue to satisfy the doctor until the
-  // legacy location is removed.
-  return isWorkspaceInitializedAt(projectRoot);
-}
-
-/**
- * Pure helper extracted from `defaultWorkspaceInitializedProbe` so tests can
- * drive the filesystem check without monkey-patching `process.cwd()` or
- * `findProjectRoot`. Returns `true` when EITHER the canonical
- * `.peaks/_runtime/session.json` OR the legacy `.peaks/.session.json` exists.
- */
-export function isWorkspaceInitializedAt(projectRoot: string): boolean {
-  return (
-    existsSync(join(projectRoot, '.peaks', '_runtime', 'session.json')) ||
-    existsSync(join(projectRoot, '.peaks', '.session.json'))
-  );
-}
-
-/**
- * Pure helper that compares the published dist `CLI_VERSION` against the
- * source-of-truth `package.json#version`. Default readers fail-soft to `null`
- * on missing/unreadable/malformed input. Exported so tests can drive the
- * filesystem reads without monkey-patching `process.cwd()`.
- */
-export function compareDistVersion(opts: {
-  projectRoot: string;
-  distVersionReader?: (root: string) => string | null;
-  sourceVersionReader?: (root: string) => string | null;
-}): DistVersionComparison {
-  const distReader = opts.distVersionReader ?? defaultDistVersionReader;
-  const sourceReader = opts.sourceVersionReader ?? defaultSourceVersionReader;
-  const dist = safeRead(() => distReader(opts.projectRoot));
-  const source = safeRead(() => sourceReader(opts.projectRoot)) ?? 'unknown';
-  const distReadable = dist !== null;
-  return {
-    dist,
-    source,
-    match: distReadable && dist === source,
-    distReadable
-  };
-}
-
-function safeRead(reader: () => string | null): string | null {
-  try {
-    return reader();
-  } catch {
-    return null;
-  }
-}
-
-function defaultDistVersionReader(projectRoot: string): string | null {
-  // Synchronous read is fine: the dist version.js is small and on the
-  // local build pipeline's hot path. readFileSync + regex is cheaper
-  // than pulling in fs/promises for a single short file.
-  const distPath = join(projectRoot, 'dist', 'src', 'shared', 'version.js');
-  if (!existsSync(distPath)) {
-    return null;
-  }
-  const body = readFileSync(distPath, 'utf8');
-  const match = /export\s+const\s+CLI_VERSION\s*=\s*["']([^"']+)["']/.exec(body);
-  return match?.[1] ?? null;
-}
-
-function defaultSourceVersionReader(projectRoot: string): string | null {
-  const pkgPath = join(projectRoot, 'package.json');
-  if (!existsSync(pkgPath)) {
-    return null;
-  }
-  const body = readFileSync(pkgPath, 'utf8');
-  const parsed = JSON.parse(body) as { version?: unknown };
-  return typeof parsed.version === 'string' ? parsed.version : null;
-}
-
-function defaultDistVersionProbe(): DistVersionComparison {
-  const projectRoot = findProjectRoot(process.cwd());
-  if (projectRoot === null) {
-    return { dist: null, source: 'unknown', match: false, distReadable: false };
-  }
-  return compareDistVersion({ projectRoot });
-}
-
-/**
- * Pure helper that inspects the on-disk workspace layout for
- * post-F3-canonical violations. The post-F3 canonical layout puts
- * session dirs under `.peaks/_runtime/<sid>/` and the runtime
- * binding at `.peaks/_runtime/session.json`; the legacy paths
- * (top-level `<YYYY-MM-DD-session-<hex>>/` dirs and the legacy
- * top-level `.peaks/.session.json` / `.peaks/.active-skill.json`
- * dotfiles) must be absent. This helper is exported so tests can
- * drive the filesystem walk without monkey-patching `process.cwd()`
- * or `findProjectRoot`.
- *
- * Both scanners fail-soft (return `[]` on read errors) so a flaky
- * filesystem read on a non-fatal probe path never escalates into a
- * doctor failure.
- */
-export function inspectWorkspaceLayout(opts: {
-  projectRoot: string;
-  topLevelScanner?: (root: string) => string[];
-  dotfileScanner?: (root: string) => string[];
-  perChangeIdScanner?: (root: string) => string[];
-}): WorkspaceLayoutInspection {
-  const topLevel = opts.topLevelScanner ?? defaultTopLevelSessionDirScanner;
-  const dotfiles = opts.dotfileScanner ?? defaultLegacyDotfileScanner;
-  const perChangeId = opts.perChangeIdScanner ?? defaultPerChangeIdDirScanner;
-  return {
-    topLevelSessionDirs: safeList(() => topLevel(opts.projectRoot)),
-    legacyDotfiles: safeList(() => dotfiles(opts.projectRoot)),
-    perChangeIdDirs: safeList(() => perChangeId(opts.projectRoot))
-  };
-}
-
-function safeList(reader: () => string[]): string[] {
-  try {
-    const out = reader();
-    return Array.isArray(out) ? out : [];
-  } catch {
-    return [];
-  }
-}
-
-const SESSION_DIR_PATTERN = /^\d{4}-\d{2}-\d{2}-session-[a-f0-9]+$/;
-
-function defaultTopLevelSessionDirScanner(projectRoot: string): string[] {
-  const peaksRoot = join(projectRoot, '.peaks');
-  if (!existsSync(peaksRoot)) return [];
-  let names: string[];
-  try {
-    names = readdirSync(peaksRoot);
-  } catch {
-    return [];
-  }
-  const offenders: string[] = [];
-  for (const name of names) {
-    if (!SESSION_DIR_PATTERN.test(name)) continue;
-    const full = join(peaksRoot, name);
-    try {
-      const stat = existsSync(full) ? lstatSync(full) : null;
-      if (stat === null) continue;
-      // Directories only — the regex should never match a dotfile or
-      // regular file, but be defensive against weird filesystem state
-      // (e.g. someone manually created a file whose name happens to
-      // match the session-id pattern).
-      if (stat.isDirectory()) {
-        offenders.push(join('.peaks', name) + '/');
-      }
-    } catch {
-      continue;
-    }
-  }
-  return offenders;
-}
-
-const LEGACY_DOTFILES: ReadonlyArray<string> = ['.session.json', '.active-skill.json'];
-
-function defaultLegacyDotfileScanner(projectRoot: string): string[] {
-  const peaksRoot = join(projectRoot, '.peaks');
-  if (!existsSync(peaksRoot)) return [];
-  const offenders: string[] = [];
-  for (const name of LEGACY_DOTFILES) {
-    if (existsSync(join(peaksRoot, name))) {
-      offenders.push(join('.peaks', name));
-    }
-  }
-  return offenders;
-}
-
-function defaultWorkspaceLayoutProbe(): WorkspaceLayoutInspection {
-  const projectRoot = findProjectRoot(process.cwd());
-  if (projectRoot === null) {
-    return { topLevelSessionDirs: [], legacyDotfiles: [], perChangeIdDirs: [] };
-  }
-  return inspectWorkspaceLayout({ projectRoot });
-}
-
-// Slice 007 — per-change-id top-level dir pattern. Matches the
-// F3-canonical (pre-canonicalization) layout the 5 already-shipped
-// slices left behind, e.g. `.peaks/001-2026-06-06-doctor-dist-version-check/`.
-// The pattern is intentionally narrow so it does NOT match the
-// post-F3 system dirs (`_runtime/`, `_dogfood/`, `retrospective/`,
-// `memory/`, `perf-baseline/`, `project-scan/`, `sops/`,
-// `0NN-session-...`, `YYYY-MM-DD-session-...`).
-const PER_CHANGE_ID_PATTERN = /^\d{3}-\d{4}-\d{2}-\d{2}-[a-z][a-z0-9-]*[a-z0-9]$/;
-
-function defaultPerChangeIdDirScanner(projectRoot: string): string[] {
-  const peaksRoot = join(projectRoot, '.peaks');
-  if (!existsSync(peaksRoot)) return [];
-  let names: string[];
-  try {
-    names = readdirSync(peaksRoot);
-  } catch {
-    return [];
-  }
-  const offenders: string[] = [];
-  for (const name of names) {
-    if (!PER_CHANGE_ID_PATTERN.test(name)) continue;
-    const full = join(peaksRoot, name);
-    try {
-      const stat = existsSync(full) ? lstatSync(full) : null;
-      if (stat === null) continue;
-      // Directories only — the regex should never match a dotfile
-      // or regular file, but be defensive against weird filesystem
-      // state (e.g. someone manually created a file whose name
-      // happens to match the per-change-id pattern).
-      if (stat.isDirectory()) {
-        offenders.push(join('.peaks', name) + '/');
-      }
-    } catch {
-      continue;
-    }
-  }
-  return offenders;
-}
-
-const DESTRUCTIVE_APPLY_PATTERNS = [
-  /peaks\s+memory\s+sync[^\n]*--apply/,
-  /peaks\s+memory\s+extract[^\n]*--apply/,
-  /peaks\s+artifacts\s+sync[^\n]*--apply/,
-  /peaks\s+openspec\s+archive[^\n]*--apply/,
-  /peaks\s+standards\s+(?:init|update)[^\n]*--apply/
-];
-
-const AUTHORIZATION_KEYWORDS_PATTERN = /authoriz|explicit|--dry-run|approv|only after|only when/i;
-
-function extractRunbookSection(body: string): string | null {
-  const match = /## Default runbook\n+([\s\S]*?)(?=\n## |$)/.exec(body);
-  return match === null ? null : (match[1] ?? null);
-}
-
-function findDestructiveApplyLines(section: string): string[] {
-  const lines = section.split(/\r?\n/);
-  return lines.filter((line) => DESTRUCTIVE_APPLY_PATTERNS.some((pattern) => pattern.test(line)));
-}
-
-// ---------------------------------------------------------------------------
-// 2026-06-10 — gateguard-fact-force integration check (NOT a peaks-cli hook).
-//
-// The `gateguard-fact-force` hook is a third-party PreToolUse hook that
-// fires on Edit / Write / MultiEdit and demands a 4-fact questionnaire
-// before allowing the edit. It is unrelated to peaks-cli, but when the
-// LLM is in a peaks-qa flow and edits `.peaks/_runtime/<sid>/qa/requests/
-// *.md`, the questionnaire demands facts that do not apply (no
-// importers, no public API, no data files, user instruction already
-// in the conversation context). The check below detects the hook in
-// `~/.claude/settings.json` and the project `.claude/settings.json`,
-// and warns when no `.peaks/**` skip is configured.
-//
-// Probing is split out of the check so the check itself stays a pure
-// mapping over `GateguardProbeResult`. Tests inject the probe to keep
-// `~/.claude/settings.json` from leaking into test fixtures.
-// ---------------------------------------------------------------------------
-
-/** Hook command fragments that identify the gateguard-fact-force hook. */
-const GATEGUARD_HOOK_NEEDLES: ReadonlyArray<string> = ['gateguard', 'fact-force', 'fact_force'];
-
-/** Token the gateguard hook exposes for "skip these paths" — the check
- *  treats any match against `.peaks` (path or globs) as a routed
- *  configuration. We accept a few common spellings because the third-
- *  party hook's CLI surface is not part of peaks-cli's contract. */
-const GATEGUARD_PEAKS_SKIP_NEEDLES: ReadonlyArray<string> = [
-  '.peaks',
-  'peaks-skip',
-  'skip-glob',
-  '--skip',
-  'skip_paths'
-];
-
-function commandMentionsGateguard(command: string | undefined): boolean {
-  if (typeof command !== 'string' || command.length === 0) return false;
-  const lower = command.toLowerCase();
-  return GATEGUARD_HOOK_NEEDLES.some((needle) => lower.includes(needle));
-}
-
-function entrySkipsPeaks(entry: GateguardHookLocation['entry']): boolean {
-  const matcher = typeof entry.matcher === 'string' ? entry.matcher : '';
-  const matcherMentionsPeaks = matcher.toLowerCase().includes('.peaks');
-  if (matcherMentionsPeaks) return true;
-  for (const hook of entry.hooks) {
-    const command = typeof hook.command === 'string' ? hook.command : '';
-    const lower = command.toLowerCase();
-    if (GATEGUARD_PEAKS_SKIP_NEEDLES.some((needle) => lower.includes(needle))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function extractGateguardEntries(
-  source: 'global' | 'project',
-  sourcePath: string,
-  settings: unknown
-): GateguardHookLocation[] {
-  if (settings === null || typeof settings !== 'object') return [];
-  const hooks = (settings as { hooks?: unknown }).hooks;
-  if (hooks === null || typeof hooks !== 'object') return [];
-  const preToolUse = (hooks as { PreToolUse?: unknown }).PreToolUse;
-  if (!Array.isArray(preToolUse)) return [];
-
-  const out: GateguardHookLocation[] = [];
-  for (const rawEntry of preToolUse) {
-    if (rawEntry === null || typeof rawEntry !== 'object') continue;
-    const entry = rawEntry as {
-      matcher?: unknown;
-      hooks?: unknown;
-    };
-    if (!Array.isArray(entry.hooks)) continue;
-    const hooks: Array<{ type?: string; command?: string }> = [];
-    for (const rawHook of entry.hooks) {
-      if (rawHook === null || typeof rawHook !== 'object') continue;
-      const h = rawHook as { type?: unknown; command?: unknown };
-      const hookEntry: { type?: string; command?: string } = {};
-      if (typeof h.type === 'string') hookEntry.type = h.type;
-      if (typeof h.command === 'string') hookEntry.command = h.command;
-      hooks.push(hookEntry);
-    }
-    if (!hooks.some((h) => commandMentionsGateguard(h.command))) continue;
-    const outEntry: {
-      matcher?: string;
-      hooks: ReadonlyArray<{ type?: string; command?: string }>;
-    } = { hooks };
-    if (typeof entry.matcher === 'string') outEntry.matcher = entry.matcher;
-    out.push({ source, sourcePath, entry: outEntry });
-  }
-  return out;
-}
-
-function readSettingsJson(path: string): unknown {
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, 'utf8')) as unknown;
-  } catch {
-    return null;
-  }
-}
-
-function defaultGateguardProbe(): GateguardProbeResult {
-  const projectRoot = findProjectRoot(process.cwd());
-  const globalPath = join(homedir(), '.claude', 'settings.json');
-  const projectPath = projectRoot === null ? null : join(projectRoot, '.claude', 'settings.json');
-
-  return {
-    globalSettingsPath: globalPath,
-    globalSettings: readSettingsJson(globalPath),
-    projectSettingsPath: projectPath,
-    projectSettings: projectPath === null ? null : readSettingsJson(projectPath)
-  };
-}
-
-export function collectGateguardEntries(probe: GateguardProbeResult): GateguardHookLocation[] {
-  const fromGlobal = extractGateguardEntries('global', probe.globalSettingsPath ?? '~/.claude/settings.json', probe.globalSettings);
-  const fromProject = probe.projectSettingsPath === null
-    ? []
-    : extractGateguardEntries('project', probe.projectSettingsPath, probe.projectSettings);
-  return [...fromGlobal, ...fromProject];
-}
 
 export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
@@ -1065,3 +604,21 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<DoctorRepo
     }
   };
 }
+
+// Re-exports — preserve public API for existing call sites (CLI commands,
+// dashboard service, test mocks). Slice N1 of PRD 008 splits the original
+// 1067-line monolith into 4 files; this file remains the single entry point.
+export {
+  isWorkspaceInitializedAt, compareDistVersion, inspectWorkspaceLayout,
+  defaultTopLevelSessionDirScanner, defaultLegacyDotfileScanner, defaultPerChangeIdDirScanner,
+  type CodegraphCapabilityProbe, type DistVersionComparison, type DistVersionProbe,
+  type WorkspaceLayoutInspection, type WorkspaceLayoutProbe
+} from './doctor-probes.js';
+
+export {
+  GATEGUARD_HOOK_NEEDLES, GATEGUARD_PEAKS_SKIP_NEEDLES,
+  commandMentionsGateguard, entrySkipsPeaks, extractGateguardEntries, collectGateguardEntries,
+  type GateguardHookLocation, type GateguardProbeResult, type GateguardProbe
+} from './doctor-gateguard.js';
+
+export { DESTRUCTIVE_APPLY_PATTERNS, AUTHORIZATION_KEYWORDS_PATTERN, extractRunbookSection, findDestructiveApplyLines } from './doctor-runbook.js';

@@ -1,16 +1,112 @@
-import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, resolve } from 'node:path';
-import type { ConfigGetOptions, ConfigLayer, ConfigSetOptions, ConfigV2, MiniMaxProviderConfig, ModelPreference, ModelProviderConfig, OcrAuthHeader, OcrConfig, OcrLlmConfig, PeaksConfig, ProxyConfig, TokenConfig, TokenRef, WorkspaceConfig } from './config-types.js';
+import { existsSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
+import type {
+  ConfigGetOptions,
+  ConfigLayer,
+  ConfigSetOptions,
+  ConfigV2,
+  ModelPreference,
+  ModelProviderConfig,
+  PeaksConfig,
+  ProxyConfig,
+  TokenConfig,
+  TokenRef
+} from './config-types.js';
 import { DEFAULT_CONFIG } from './config-types.js';
-import { stablePath } from '../../shared/path-utils.js';
-import { findProjectRoot, getProjectBootstrapConfigPath, getProjectConfigPath, getUserConfigPath, isInsidePath, readConfigFileSafely, resolveCanonicalProjectRoot, resolveProjectRootForConfig, validateArtifactWorkspaceMarkerPath, validateArtifactWorkspaceRoot, validateProjectBootstrapConfigPathForWrite, validateUserConfigPathForWrite, writeConfigFileSafely, writeProjectConfigFile, writeUserConfigFile } from './config-safety.js';
+import {
+  findProjectRoot,
+  getProjectBootstrapConfigPath,
+  getProjectConfigPath,
+  getUserConfigPath,
+  readConfigFileSafely,
+  resolveProjectRootForConfig,
+  validateProjectBootstrapConfigPathForWrite,
+  validateUserConfigPathForWrite,
+  writeProjectConfigFile,
+  writeUserConfigFile
+} from './config-safety.js';
 import { globalConfigPath, CONFIG_SCHEMA_VERSION_V2 } from './config-migration.js';
 import { isConfigV2 } from './config-types.js';
 import { providersConfigPath, proxyConfigPath, readSidecarJson, sidecarExists, workspacesConfigPath, writeSidecarJson } from './sidecar-store.js';
 import { SIDECAR_SCHEMA_VERSION } from './sidecar-store.js';
+import {
+  getNestedPathParts,
+  getNestedValue,
+  isRecord,
+  isSafeConfigSegment,
+  readJsonFile,
+  setNestedValue,
+  toWorkspaceConfig,
+  toWorkspaceConfigs as toWorkspaceConfigsFromNested
+} from './config-nested.js';
+import { readOcrFromRawConfigFile } from './config-ocr.js';
+import {
+  isProviderBaseUrlPath,
+  isProviderConfigPath,
+  MINIMAX_API_HOST,
+  validateMiniMaxBaseUrl,
+  validateModelProviderConfig,
+  validateProviderBaseUrl,
+  getMiniMaxBaseUrlCandidate
+} from './provider-service.js';
 
 // Re-export resolveProjectRootForConfig and resolveCanonicalProjectRoot for external consumers
 export { resolveProjectRootForConfig, resolveCanonicalProjectRoot } from './config-safety.js';
+
+// Re-exports for moved symbols (preserve public API).
+export {
+  isProviderConfigPath,
+  isProviderBaseUrlPath,
+  isValidProviderBaseUrl,
+  isValidMiniMaxBaseUrl,
+  validateProviderBaseUrl,
+  validateMiniMaxBaseUrl,
+  validateModelProviderConfig,
+  MINIMAX_API_HOST,
+  getAllProviders,
+  setProviderConfig
+} from './provider-service.js';
+export type {
+  MiniMaxProviderConfig,
+  ModelProviderConfig,
+  ProviderModelConfig,
+  ModelProviderId,
+  ExecutionModelId,
+  ModelPreference
+} from './provider-service.js';
+
+export type MiniMaxProviderStatus = LegacyMiniMaxProviderStatus;
+
+export {
+  getOcrConfig,
+  getOcrLlmConfig,
+  readOcrFromRawConfigFile
+} from './config-ocr.js';
+
+export {
+  getWorkspaceConfig,
+  addWorkspace,
+  removeWorkspace,
+  setCurrentWorkspace,
+  getCurrentWorkspaceConfig,
+  getWorkspaceConfigForPath,
+  ensureWorkspaceConfigForPath,
+  getWorkspaceConfigForCurrentPath,
+  ensureWorkspaceConfigForCurrentPath
+} from './config-workspace.js';
+
+export {
+  getNestedPathParts,
+  hasUnsafeNestedPathSegment,
+  getNestedValue,
+  setNestedValue,
+  isRecord,
+  isSafeConfigSegment,
+  toArtifactRemoteRepoConfig,
+  toArtifactStorageConfig,
+  toWorkspaceConfig,
+  readJsonFile
+} from './config-nested.js';
 
 /**
  * Load the slim 2.0 `~/.peaks/config.json` file. Returns the parsed
@@ -100,25 +196,6 @@ function rewriteSlimGlobalConfig(): void {
   writeUserConfigFile(path, JSON.stringify(slim, null, 2) + '\n');
 }
 
-function readOcrFromRawConfigFile(): Record<string, unknown> | null {
-  const path = globalConfigPath();
-  if (!existsSync(path)) return null;
-  const content = readConfigFileSafely(path, 'Global config path must stay inside the user root');
-  const raw = JSON.parse(content) as Record<string, unknown>;
-  return isRecord(raw.ocr) ? raw.ocr : null;
-}
-
-function readJsonFile(path: string | null, validateBeforeRead?: () => void, errorMessage = 'Config path must stay inside the config root'): Partial<PeaksConfig> | null {
-  if (!path || !existsSync(path)) return null;
-  validateBeforeRead?.();
-  const content = readConfigFileSafely(path, errorMessage);
-  try {
-    return JSON.parse(content) as Partial<PeaksConfig>;
-  } catch {
-    return null;
-  }
-}
-
 function readExistingJsonFile(path: string, errorMessage: string, validateBeforeRead?: () => void): Partial<PeaksConfig> | null {
   if (!existsSync(path)) return null;
   validateBeforeRead?.();
@@ -143,50 +220,6 @@ function ensureDir(dirPath: string): void {
   if (!existsSync(dirPath)) {
     mkdirSync(dirPath, { recursive: true });
   }
-}
-
-const UNSAFE_NESTED_PATH_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
-
-function getNestedPathParts(path: string): string[] {
-  return path.replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
-}
-
-function hasUnsafeNestedPathSegment(parts: string[]): boolean {
-  return parts.some((part) => UNSAFE_NESTED_PATH_SEGMENTS.has(part));
-}
-
-function getNestedValue(obj: Record<string, unknown>, path: string): unknown {
-  const parts = getNestedPathParts(path);
-  if (parts.length === 0 || hasUnsafeNestedPathSegment(parts)) {
-    return undefined;
-  }
-
-  let current: unknown = obj;
-  for (const part of parts) {
-    if (current === null || current === undefined || typeof current !== 'object' || !Object.prototype.hasOwnProperty.call(current, part)) {
-      return undefined;
-    }
-    current = (current as Record<string, unknown>)[part];
-  }
-  return current;
-}
-
-function setNestedValue(obj: Record<string, unknown>, path: string, value: unknown): void {
-  const parts = getNestedPathParts(path);
-  if (parts.length === 0 || hasUnsafeNestedPathSegment(parts)) {
-    throw new Error('Unsafe config path');
-  }
-
-  let current: Record<string, unknown> = obj;
-  for (let i = 0; i < parts.length - 1; i++) {
-    const part = parts[i] as string;
-    if (!Object.prototype.hasOwnProperty.call(current, part) || typeof current[part] !== 'object' || current[part] === null || Array.isArray(current[part])) {
-      current[part] = {};
-    }
-    current = current[part] as Record<string, unknown>;
-  }
-  const last = parts[parts.length - 1] as string;
-  current[last] = value;
 }
 
 function removeProjectSensitiveConfig(config: Partial<PeaksConfig>): Partial<PeaksConfig> {
@@ -225,10 +258,6 @@ export function isLegacyConfigKey(path: string): boolean {
   return LEGACY_CONFIG_KEYS.has(topLevel);
 }
 
-function isProviderConfigPath(path: string): boolean {
-  return path === 'providers' || path.startsWith('providers.');
-}
-
 function isSecretKey(key: string): boolean {
   return isSensitiveConfigPath(key);
 }
@@ -246,55 +275,6 @@ function sanitizeBaseUrlForDisplay(value: string): string {
   }
 }
 
-const MINIMAX_API_HOST = 'api.minimaxi.com';
-
-function isProviderBaseUrlPath(path: string): boolean {
-  return /^providers\.[^.]+\.baseUrl$/.test(path);
-}
-
-function isValidProviderBaseUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === 'https:' && url.username.length === 0 && url.password.length === 0 && url.search.length === 0 && url.hash.length === 0;
-  } catch {
-    return false;
-  }
-}
-
-function isValidMiniMaxBaseUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return url.protocol === 'https:' && url.hostname === MINIMAX_API_HOST && url.username.length === 0 && url.password.length === 0 && url.search.length === 0 && url.hash.length === 0;
-  } catch {
-    return false;
-  }
-}
-
-function getMiniMaxBaseUrlCandidate(key: string, value: unknown): unknown {
-  if (key === 'providers.minimax.baseUrl') {
-    return value;
-  }
-  if (key === 'providers.minimax' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
-    return (value as Partial<MiniMaxProviderConfig>).baseUrl;
-  }
-  if (key === 'providers' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
-    return (value as Partial<ModelProviderConfig>).minimax?.baseUrl;
-  }
-  return undefined;
-}
-
-function validateProviderBaseUrl(value: unknown): void {
-  if (value !== undefined && (typeof value !== 'string' || !isValidProviderBaseUrl(value))) {
-    throw new Error('Provider base URL must be HTTPS without embedded credentials, query, or fragment');
-  }
-}
-
-function validateMiniMaxBaseUrl(value: unknown): void {
-  if (value !== undefined && (typeof value !== 'string' || !isValidMiniMaxBaseUrl(value))) {
-    throw new Error('MiniMax base URL must be the MiniMax HTTPS endpoint without embedded credentials');
-  }
-}
-
 function getProxyUrlCandidate(key: string, value: unknown): unknown {
   if (key === 'proxy.httpProxy') {
     return value;
@@ -307,15 +287,6 @@ function getProxyUrlCandidate(key: string, value: unknown): unknown {
 
 function isProxyConfigPath(path: string): boolean {
   return path === 'proxy' || path.startsWith('proxy.');
-}
-
-function validateModelProviderConfig(providers: ModelProviderConfig): void {
-  validateMiniMaxBaseUrl(providers.minimax?.baseUrl);
-  for (const [providerId, provider] of Object.entries(providers)) {
-    if (providerId !== 'minimax') {
-      validateProviderBaseUrl(provider?.baseUrl);
-    }
-  }
 }
 
 function validateProviderConfig(partial: Partial<PeaksConfig>): void {
@@ -341,70 +312,13 @@ function validateProxyConfig(partial: Partial<PeaksConfig>): void {
   validateProxyUrl(partial.proxy?.httpProxy);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function isSafeConfigSegment(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value) && !value.includes('..') && !value.endsWith('.');
-}
-
-function toArtifactRemoteRepoConfig(value: unknown): WorkspaceConfig['artifactRepo'] | null {
-  if (!isRecord(value) || (value.provider !== 'github' && value.provider !== 'gitlab') || typeof value.owner !== 'string' || typeof value.name !== 'string') {
-    return null;
-  }
-  if (!isSafeConfigSegment(value.owner) || !isSafeConfigSegment(value.name)) {
-    return null;
-  }
-  return { provider: value.provider, owner: value.owner, name: value.name };
-}
-
-function toArtifactStorageConfig(value: unknown): WorkspaceConfig['artifactStorage'] | null {
-  if (!isRecord(value)) return null;
-  const localPath = typeof value.localPath === 'string' ? { localPath: value.localPath } : {};
-  if (value.mode === 'local') {
-    return { mode: 'local', ...localPath };
-  }
-  const remote = toArtifactRemoteRepoConfig(value.remote);
-  if (value.mode === 'local-with-remote-sync' && remote) {
-    return { mode: 'local-with-remote-sync', ...localPath, remote };
-  }
-  return null;
-}
-
-function toWorkspaceConfig(value: unknown): WorkspaceConfig | null {
-  if (!isRecord(value)) return null;
-  const { workspaceId, name, rootPath, installedCapabilityIds } = value;
-  if (typeof workspaceId !== 'string' || !isSafeConfigSegment(workspaceId) || typeof name !== 'string' || typeof rootPath !== 'string' || !Array.isArray(installedCapabilityIds) || !installedCapabilityIds.every((id) => typeof id === 'string')) {
-    return null;
-  }
-  const artifactRepo = toArtifactRemoteRepoConfig(value.artifactRepo);
-  const artifactStorage = toArtifactStorageConfig(value.artifactStorage);
-  return {
-    workspaceId,
-    name,
-    rootPath,
-    installedCapabilityIds,
-    ...(artifactRepo ? { artifactRepo } : {}),
-    ...(artifactStorage ? { artifactStorage } : {})
-  };
-}
-
-function toWorkspaceConfigs(value: unknown): WorkspaceConfig[] {
-  return Array.isArray(value) ? value.map(toWorkspaceConfig).filter((workspace): workspace is WorkspaceConfig => workspace !== null) : [];
-}
-
-function toProviderModelConfig(value: unknown): MiniMaxProviderConfig {
+function toProviderModelConfig(value: unknown): { model?: string; baseUrl?: string; apiKey?: string } {
   if (!isRecord(value)) return {};
   return {
     ...(typeof value.model === 'string' && value.model.trim().length > 0 ? { model: value.model.trim() } : {}),
     ...(typeof value.baseUrl === 'string' ? { baseUrl: value.baseUrl } : {}),
     ...(typeof value.apiKey === 'string' ? { apiKey: value.apiKey } : {})
   };
-}
-
-function toMiniMaxProviderConfig(value: unknown): MiniMaxProviderConfig {
-  return toProviderModelConfig(value);
 }
 
 const TOKEN_CONFIG_KEYS = new Set<keyof TokenConfig>(['AnthropicApiKey', 'OpenAiApiKey', 'GitHubToken', 'GitLabToken']);
@@ -493,7 +407,14 @@ export function redactConfigSecrets(value: unknown, path = ''): RedactedConfigVa
   }));
 }
 
-export type MiniMaxProviderStatus = {
+// Legacy config.json-based MiniMax provider helpers preserved as-is.
+// The canonical 2.0 store is `~/.peaks/providers.json` (provider-service.ts),
+// but the legacy `~/.peaks/config.json.providers` schema is still the read
+// source for these functions to preserve the test-suite contract:
+// `setMiniMaxProviderConfig({ apiKey })` must throw when the stored
+// baseUrl fails MiniMax validation, even though `input.baseUrl` is undefined.
+
+export type LegacyMiniMaxProviderStatus = {
   provider: 'minimax';
   configured: boolean;
   baseUrlConfigured: boolean;
@@ -502,10 +423,10 @@ export type MiniMaxProviderStatus = {
   nextActions: string[];
 };
 
-function createMiniMaxProviderStatus(config: MiniMaxProviderConfig): MiniMaxProviderStatus {
+function createLegacyMiniMaxProviderStatus(config: { model?: string; baseUrl?: string; apiKey?: string }): LegacyMiniMaxProviderStatus {
   const baseUrl = config.baseUrl?.trim();
   const apiKey = config.apiKey?.trim();
-  const baseUrlConfigured = typeof baseUrl === 'string' && baseUrl.length > 0 && isValidMiniMaxBaseUrl(baseUrl);
+  const baseUrlConfigured = typeof baseUrl === 'string' && baseUrl.length > 0 && isValidLegacyMiniMaxBaseUrl(baseUrl);
   const apiKeyConfigured = typeof apiKey === 'string' && apiKey.length > 0;
   return {
     provider: 'minimax',
@@ -517,15 +438,24 @@ function createMiniMaxProviderStatus(config: MiniMaxProviderConfig): MiniMaxProv
   };
 }
 
-export function getMiniMaxProviderConfig(): MiniMaxProviderConfig {
-  return toMiniMaxProviderConfig(readUserJsonFile()?.providers?.minimax);
+function isValidLegacyMiniMaxBaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname === MINIMAX_API_HOST && url.username.length === 0 && url.password.length === 0 && url.search.length === 0 && url.hash.length === 0;
+  } catch {
+    return false;
+  }
 }
 
-export function getMiniMaxProviderStatus(): MiniMaxProviderStatus {
-  return createMiniMaxProviderStatus(getMiniMaxProviderConfig());
+export function getMiniMaxProviderConfig(): { model?: string; baseUrl?: string; apiKey?: string } {
+  return toProviderModelConfig(readUserJsonFile()?.providers?.minimax);
 }
 
-export function setMiniMaxProviderConfig(input: MiniMaxProviderConfig): MiniMaxProviderStatus {
+export function getMiniMaxProviderStatus(): LegacyMiniMaxProviderStatus {
+  return createLegacyMiniMaxProviderStatus(getMiniMaxProviderConfig());
+}
+
+export function setMiniMaxProviderConfig(input: { model?: string; baseUrl?: string; apiKey?: string }): LegacyMiniMaxProviderStatus {
   validateMiniMaxBaseUrl(input.baseUrl);
   const userConfig = readUserJsonFile() ?? {};
   const existingProviders = toModelProviderConfig(userConfig.providers);
@@ -538,61 +468,7 @@ export function setMiniMaxProviderConfig(input: MiniMaxProviderConfig): MiniMaxP
   };
   validateMiniMaxBaseUrl(providers.minimax?.baseUrl);
   writeConfig({ providers }, 'user');
-  return createMiniMaxProviderStatus(providers.minimax ?? {});
-}
-
-const OCR_AUTH_HEADERS: ReadonlySet<OcrAuthHeader> = new Set<OcrAuthHeader>(['authorization', 'x-api-key', 'bearer']);
-
-function toOcrLlmConfig(value: unknown): OcrLlmConfig {
-  if (!isRecord(value)) return {};
-  const url = typeof value.url === 'string' && value.url.trim().length > 0 ? value.url.trim() : undefined;
-  const authToken = typeof value.authToken === 'string' && value.authToken.length > 0 ? value.authToken : undefined;
-  const model = typeof value.model === 'string' && value.model.trim().length > 0 ? value.model.trim() : undefined;
-  const useAnthropic = typeof value.useAnthropic === 'boolean' ? value.useAnthropic : undefined;
-  const rawAuthHeader = typeof value.authHeader === 'string' ? value.authHeader : undefined;
-  const authHeader = rawAuthHeader !== undefined && OCR_AUTH_HEADERS.has(rawAuthHeader as OcrAuthHeader)
-    ? (rawAuthHeader as OcrAuthHeader)
-    : undefined;
-  return {
-    ...(url !== undefined ? { url } : {}),
-    ...(authToken !== undefined ? { authToken } : {}),
-    ...(model !== undefined ? { model } : {}),
-    ...(useAnthropic !== undefined ? { useAnthropic } : {}),
-    ...(authHeader !== undefined ? { authHeader } : {})
-  };
-}
-
-function toOcrConfig(value: unknown): OcrConfig {
-  if (!isRecord(value)) return {};
-  return {
-    ...(isRecord(value.llm) ? { llm: toOcrLlmConfig(value.llm) } : {})
-  };
-}
-
-/**
- * Read the ocr LLM endpoint config from the user-layer
- * `~/.peaks/config.json`. The user populates this themselves by
- * pasting the `peaks code-review config-template` output (or by
- * running `peaks config set --key ocr.llm.url --value '...'`).
- * peaks-cli never auto-writes these values.
- */
-export function getOcrConfig(): OcrConfig {
-  const userConfig = readUserJsonFile() ?? {};
-  return toOcrConfig(userConfig.ocr);
-}
-
-/**
- * Return the resolved `OcrLlmConfig` block (`peaksConfig.ocr.llm`)
- * or `null` when the user has not populated the user config. The
- * 5-state OCR detector uses this as the source of truth; when the
- * returned block is missing required fields it produces a
- * `config-missing` state with a templated `nextActions` payload
- * the user can paste into their config.
- */
-export function getOcrLlmConfig(): OcrLlmConfig | null {
-  const ocr = getOcrConfig();
-  if (!ocr.llm) return null;
-  return ocr.llm;
+  return createLegacyMiniMaxProviderStatus(providers.minimax ?? {});
 }
 
 function inferHumanLanguage(value: string): string {
@@ -650,7 +526,7 @@ export function readConfig(projectRoot?: string | null): PeaksConfig {
 function sanitizeWorkspacePartial(partial: Record<string, unknown>): Record<string, unknown> {
   const result = { ...partial };
   if (Array.isArray(result.workspaces)) {
-    result.workspaces = toWorkspaceConfigs(result.workspaces);
+    result.workspaces = toWorkspaceConfigsFromNested(result.workspaces);
   }
   if (typeof result.currentWorkspace !== 'string' && result.currentWorkspace !== null && result.currentWorkspace !== undefined) {
     delete result.currentWorkspace;
@@ -750,162 +626,6 @@ export function setConfig(options: ConfigSetOptions): void {
   }
 }
 
-// Raw config helpers for workspace management functions that operate on
-// fields (workspaces, currentWorkspace) no longer in the typed PeaksConfig schema.
-
-interface RawWorkspaceData {
-  currentWorkspace: string | null;
-  workspaces: WorkspaceConfig[];
-}
-
-function readRawWorkspaceData(layer: ConfigLayer): RawWorkspaceData {
-  const config = getConfig({ layer });
-  return isRecord(config)
-    ? {
-      currentWorkspace: typeof config.currentWorkspace === 'string' ? config.currentWorkspace : null,
-      workspaces: toWorkspaceConfigs(config.workspaces)
-    }
-    : { currentWorkspace: null, workspaces: [] };
-}
-
-function writeRawWorkspaceData(data: Partial<RawWorkspaceData>, layer: ConfigLayer): void {
-  const projectTarget = layer === 'project' ? getProjectWriteTarget() : null;
-  const targetPath = projectTarget?.configPath ?? getUserConfigPath();
-  ensureDir(dirname(targetPath));
-  const existing = projectTarget
-    ? readJsonFile(targetPath, () => validateProjectBootstrapConfigPathForWrite(projectTarget.projectRoot, targetPath)) ?? {}
-    : readJsonFile(targetPath, () => validateUserConfigPathForWrite(targetPath)) ?? {};
-  const merged = { ...existing, ...data };
-  const content = JSON.stringify(merged, null, 2);
-  if (projectTarget) {
-    writeProjectConfigFile(projectTarget.projectRoot, targetPath, content);
-  } else {
-    writeUserConfigFile(targetPath, content);
-  }
-}
-
-function readAllWorkspaces(): { currentWorkspace: string | null; workspaces: WorkspaceConfig[] } {
-  const userData = readRawWorkspaceData('user');
-  const projectData = readRawWorkspaceData('project');
-  const mergedWorkspaces = new Map<string, WorkspaceConfig>();
-  for (const w of userData.workspaces) mergedWorkspaces.set(w.workspaceId, w);
-  for (const w of projectData.workspaces) mergedWorkspaces.set(w.workspaceId, w);
-  return {
-    currentWorkspace: projectData.currentWorkspace ?? userData.currentWorkspace,
-    workspaces: [...mergedWorkspaces.values()]
-  };
-}
-
-export function getWorkspaceConfig(workspaceId: string, _projectRoot?: string | null): WorkspaceConfig | null {
-  const { workspaces } = readAllWorkspaces();
-  return workspaces.find((w) => w.workspaceId === workspaceId) ?? null;
-}
-
-function readLayerConfig(layer: ConfigLayer): { currentWorkspace: string | null; workspaces: WorkspaceConfig[] } {
-  return readRawWorkspaceData(layer);
-}
-
-export function addWorkspace(workspace: WorkspaceConfig, layer: ConfigLayer = 'user'): void {
-  if (!isSafeConfigSegment(workspace.workspaceId)) {
-    throw new Error('Workspace id must only contain letters, numbers, dots, underscores, or hyphens and must not contain path traversal');
-  }
-  const config = readRawWorkspaceData(layer);
-  const workspaces = config.workspaces;
-  const existing = workspaces.findIndex((w) => w.workspaceId === workspace.workspaceId);
-  const updatedWorkspaces = existing >= 0
-    ? workspaces.map((existingWorkspace) => existingWorkspace.workspaceId === workspace.workspaceId ? workspace : existingWorkspace)
-    : [...workspaces, workspace];
-  writeRawWorkspaceData({ workspaces: updatedWorkspaces }, layer);
-}
-
-export function removeWorkspace(workspaceId: string, layer: ConfigLayer = 'user'): boolean {
-  if (!isSafeConfigSegment(workspaceId)) return false;
-  const config = readRawWorkspaceData(layer);
-  const workspaces = config.workspaces;
-  const idx = workspaces.findIndex((w) => w.workspaceId === workspaceId);
-  if (idx < 0) return false;
-
-  const updatedWorkspaces = workspaces.filter((w) => w.workspaceId !== workspaceId);
-  const currentWorkspace = config.currentWorkspace === workspaceId ? updatedWorkspaces[0]?.workspaceId ?? null : config.currentWorkspace ?? null;
-
-  writeRawWorkspaceData({ workspaces: updatedWorkspaces, currentWorkspace }, layer);
-  return true;
-}
-
-export function setCurrentWorkspace(workspaceId: string, layer: ConfigLayer = 'user'): boolean {
-  if (!isSafeConfigSegment(workspaceId)) return false;
-  const config = readRawWorkspaceData(layer);
-  const workspaces = config.workspaces;
-  const exists = workspaces.some((w) => w.workspaceId === workspaceId);
-  if (!exists) return false;
-
-  writeRawWorkspaceData({ currentWorkspace: workspaceId }, layer);
-  return true;
-}
-
-export function getCurrentWorkspaceConfig(): WorkspaceConfig | null {
-  const { currentWorkspace, workspaces } = readAllWorkspaces();
-  if (!currentWorkspace) return null;
-  return workspaces.find((w) => w.workspaceId === currentWorkspace) ?? null;
-}
-
-export function getWorkspaceConfigForPath(path = process.cwd()): WorkspaceConfig | null {
-  const { workspaces } = readAllWorkspaces();
-  return findWorkspaceForPath(workspaces, path);
-}
-
-function findWorkspaceForPath(workspaces: WorkspaceConfig[], path: string): WorkspaceConfig | null {
-  const targetPath = stablePath(path);
-  const matches = workspaces.flatMap((workspace) => {
-    if (!isAbsolute(workspace.rootPath) || !existsSync(workspace.rootPath)) return [];
-    const rootPath = stablePath(workspace.rootPath);
-    return isInsidePath(targetPath, rootPath) ? [{ workspace, rootPath }] : [];
-  });
-  if (matches.length === 0) return null;
-
-  return matches.reduce((best, match) => match.rootPath.length > best.rootPath.length ? match : best).workspace;
-}
-
-function getWorkspaceArtifactRoot(workspace: WorkspaceConfig): string {
-  return workspace.artifactStorage?.localPath ? resolve(workspace.artifactStorage.localPath) : resolve(workspace.rootPath, '.peaks', 'artifacts');
-}
-
-function ensureArtifactWorkspaceMarker(workspace: WorkspaceConfig): void {
-  const artifactRoot = getWorkspaceArtifactRoot(workspace);
-  const peaksPath = resolve(artifactRoot, '.peaks');
-  const markerPath = resolve(peaksPath, 'config.json');
-  ensureDir(artifactRoot);
-  validateArtifactWorkspaceRoot(artifactRoot, workspace.rootPath);
-
-  ensureDir(peaksPath);
-  validateArtifactWorkspaceMarkerPath(artifactRoot, peaksPath, markerPath);
-  if (!existsSync(markerPath)) {
-    writeConfigFileSafely(markerPath, '{}\n', () => validateArtifactWorkspaceMarkerPath(artifactRoot, peaksPath, markerPath), 'Artifact workspace marker must stay inside the artifact workspace');
-  }
-}
-
-export function ensureWorkspaceConfigForPath(path = process.cwd()): WorkspaceConfig | null {
-  const projectRoot = resolveProjectRootForConfig(path);
-  if (!isAbsolute(projectRoot) || !existsSync(projectRoot)) return null;
-
-  const config = readLayerConfig('user');
-  const existingWorkspace = findWorkspaceForPath(config.workspaces, path);
-  if (existingWorkspace) {
-    ensureArtifactWorkspaceMarker(existingWorkspace);
-    return existingWorkspace;
-  }
-
-  return null;
-}
-
-export function getWorkspaceConfigForCurrentPath(): WorkspaceConfig | null {
-  return getWorkspaceConfigForPath(process.cwd());
-}
-
-export function ensureWorkspaceConfigForCurrentPath(): WorkspaceConfig | null {
-  return ensureWorkspaceConfigForPath(process.cwd());
-}
-
-export type { OcrAuthHeader, OcrConfig, OcrLlmConfig, TokenRef, WorkspaceConfig, PeaksConfig, ConfigLayer };
+export type { PeaksConfig, ConfigLayer };
 export { getUserConfigPath } from './config-safety.js';
 export { globalConfigPath } from './config-migration.js';

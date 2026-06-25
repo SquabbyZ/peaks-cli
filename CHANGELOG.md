@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.10.0] — 2026-06-25 — File-size cap refactor
+
+**MINOR bump from 2.9.0** — closes the P0 file-size cap regression (3 services over 800-line cap AND in vitest coverage carve-out).
+
+### Refactor
+
+- **`src/services/doctor/doctor-service.ts`**: 1067 → 623 lines. Extracted `doctor-probes.ts` (297), `doctor-gateguard.ts` (163), `doctor-runbook.ts` (19). Public API preserved via re-exports.
+- **`src/services/memory/project-memory-service.ts`**: 1028 → 427 lines. Extracted `project-memory-safety.ts` (144), `project-memory-index.ts` (333), `project-memory-extract.ts` (332). Public API preserved via re-exports. (NB: this file was never in the vitest coverage carve-out list; the file was already at 100% coverage.)
+- **`src/services/config/config-service.ts`**: 911 → 630 lines. Extended `provider-service.ts` (203, +21). Extracted `config-nested.ts` (122), `config-ocr.ts` (79), `config-workspace.ts` (203). Public API preserved via re-exports.
+
+### Coverage
+
+- `vitest.config.ts`: documented carve-out for `config-service.ts` (94.75% branches — 13 uncovered defensive paths in `readJsonFile` / `getNestedValue` / `setNestedValue` / `getConfig` non-object path / proxy / OCR / miniMax validation; investigation in `.peaks/_runtime/2026-06-25-session-fe94e7/rd/requests/N5-cycle-3-v8-quirk-refactor.md` and `N6-cycle-4-non-object-test.md`). Follow-up slice queued.
+- `doctor-service.ts`: 100% all 4 metrics (the re-exports are covered by the existing `runDoctor` test surface).
+- Added 33 tests across 7 new test files (cycle 2 + cycle 4).
+
+### Tests
+
+- 3906 passed / 17 skipped / 0 failed (full suite).
+- 1 pre-existing Windows-only perf benchmark fail (`dispatch-cli-latency-benchmark.test.ts`) was not introduced by this slice — out of scope, not fixed.
+
+### Deviations (RD-documented, QA-accepted)
+
+- **N1 D1**: `doctor-service.ts` at 623 lines (vs 600 target) — `runDoctor` 530-line body not split (Karpathy #3 surgical).
+- **N2 D1**: `generateMemoryIndexFile` and `readStoredMemoryNames` signatures changed to inject dependency rather than take a path, breaking circular import. Public API unchanged.
+- **N3 D1**: Created new `config-workspace.ts` (legacy config.json-based) rather than extending `workspace-state-service.ts` (sidecar-based) — different storage contracts.
+- **N3 D2**: Legacy MiniMax provider impls kept in `config-service.ts` (with `LegacyMiniMaxProviderStatus` type) — canonical sidecar version doesn't satisfy existing test contract for merged-validation throws. Migration queued as a follow-up.
+
+### Reference
+
+- Parent PRD: `.peaks/_runtime/2026-06-25-session-fe94e7/prd/requests/008-2026-06-25-p0-file-size-cap-refactor.md`
+- Blocked TXT handoff: `.peaks/_runtime/2026-06-25-session-fe94e7/txt/handoff-008-p0-file-size-cap.md`
+
+---
+
 ## [2.9.0] — 2026-06-25 — Path canonicalization + fan-out mandatory + test-tool-detection
 
 **MINOR bump from 2.8.4** (supersedes the unpublished 2.9.1 / 2.9.2 intermediate work; those entries below are kept as historical context only).

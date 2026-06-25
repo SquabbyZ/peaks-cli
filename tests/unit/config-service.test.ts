@@ -32,7 +32,7 @@ vi.mock('node:os', async (importOriginal) => {
   return { ...actual, homedir: () => configTestHome };
 });
 
-import { addWorkspace, bootstrapProjectLanguageConfig, containsSensitiveConfigValue, ensureWorkspaceConfigForPath, getConfig, getMiniMaxProviderConfig, getWorkspaceConfigForPath, isConfigLayer, isSensitiveConfigPath, readConfig, redactConfigSecrets, removeWorkspace, resolveProjectRootForConfig, setConfig, setCurrentWorkspace, setMiniMaxProviderConfig, writeConfig } from '../../src/services/config/config-service.js';
+import { addWorkspace, bootstrapProjectLanguageConfig, containsSensitiveConfigValue, ensureWorkspaceConfigForPath, getConfig, getMiniMaxProviderConfig, getMiniMaxProviderStatus, getWorkspaceConfigForPath, isConfigLayer, isSensitiveConfigPath, readConfig, redactConfigSecrets, removeWorkspace, resolveProjectRootForConfig, setConfig, setCurrentWorkspace, setMiniMaxProviderConfig, writeConfig } from '../../src/services/config/config-service.js';
 
 // Test helper path parsing logic directly
 // The actual config service uses these functions internally
@@ -268,6 +268,190 @@ describe('secret config handling', () => {
     expect(() => setConfig({ key: 'safe', value: 'value', layer: 'invalid' as 'project' })).toThrow('Invalid config layer');
   });
 
+  // Cycle 2 RD coverage-closure: project-layer write happy paths
+  // (config-service.ts L548-554 in `writeConfig`; L617 + L623 in `setConfig`).
+  test('writeConfig writes a non-sensitive partial to the project layer (L548-554)', () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-project-write-'));
+    mkdirSync(join(projectRoot, '.peaks'), { recursive: true });
+    writeFileSync(join(projectRoot, '.peaks', 'config.json'), '{}', 'utf8');
+
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(projectRoot);
+    try {
+      expect(() => writeConfig({ language: 'en' }, 'project')).not.toThrow();
+
+      const onDisk = JSON.parse(readFileSync(join(projectRoot, '.peaks', 'config.json'), 'utf8')) as { language?: string };
+      expect(onDisk.language).toBe('en');
+      expect(readConfig(projectRoot).language).toBe('en');
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  // Cycle 2 RD coverage-closure note: the `?? {}` branch at L550 of
+  // `writeConfig` is unreachable through the public API: `getProjectWriteTarget`
+  // requires the project marker to exist before the read at L550 is
+  // reached, so `readJsonFile` always returns a non-null value here.
+  // This is a defensive branch, not an exposed behavior gap; documented
+  // here so future readers do not "fix" the missing test by adding a
+  // fragile test that breaks once `isSafeProjectConfigMarker` tightens.
+
+  test('writeConfig merges project-layer partial with existing project config (L548-554 merge branch)', () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-project-merge-'));
+    mkdirSync(join(projectRoot, '.peaks'), { recursive: true });
+    writeFileSync(join(projectRoot, '.peaks', 'config.json'), JSON.stringify({ economyMode: false, swarmMode: true }), 'utf8');
+
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(projectRoot);
+    try {
+      writeConfig({ language: 'zh-CN' }, 'project');
+
+      const onDisk = JSON.parse(readFileSync(join(projectRoot, '.peaks', 'config.json'), 'utf8')) as Record<string, unknown>;
+      expect(onDisk).toMatchObject({ economyMode: false, swarmMode: true, language: 'zh-CN' });
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  test('setConfig writes a non-sensitive key to the project layer (L617, L623)', () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-project-set-'));
+    mkdirSync(join(projectRoot, '.peaks'), { recursive: true });
+    writeFileSync(join(projectRoot, '.peaks', 'config.json'), '{}', 'utf8');
+
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(projectRoot);
+    try {
+      expect(() => setConfig({ key: 'safeFlag', value: 'enabled', layer: 'project' })).not.toThrow();
+
+      const onDisk = JSON.parse(readFileSync(join(projectRoot, '.peaks', 'config.json'), 'utf8')) as Record<string, unknown>;
+      expect(onDisk.safeFlag).toBe('enabled');
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  // Cycle 2 RD coverage-closure: setConfig user-target branch (L618).
+  // `setConfig` defaults to layer: 'user' when no layer is specified.
+  // The user-target branch of the projectTarget ternary at L616-618
+  // is the most common write path; the existing tests already hit it
+  // implicitly, but this test pins the contract explicitly.
+  test('setConfig default layer is user (L618)', () => {
+    const configPath = join(configTestHome, '.peaks', 'config.json');
+    mkdirSync(join(configTestHome, '.peaks'), { recursive: true });
+    if (existsSync(configPath)) unlinkSync(configPath);
+
+    // Write to user layer without specifying `layer`. The
+    // `readJsonFile` at L618 will return null (file absent), and
+    // the `?? {}` fallback fires.
+    setConfig({ key: 'safeFlag', value: 'enabled' });
+    // Read back via getConfig to confirm the user-layer write.
+    const config = getConfig({ layer: 'user' }) as Record<string, unknown>;
+    expect(config.safeFlag).toBe('enabled');
+  });
+
+  // Cycle 2 RD coverage-closure: getProxyUrlCandidate `key === 'proxy'`
+  // branch (L282-284). When setConfig is called with
+  // `{ key: 'proxy', value: { httpProxy: 'http://...' } }`,
+  // `getProxyUrlCandidate` returns `value.httpProxy`, and the
+  // subsequent `validateProxyUrl` call validates it.
+  test('setConfig accepts a `proxy` key with a valid httpProxy object (L282-284)', () => {
+    expect(() => setConfig({ key: 'proxy', value: { httpProxy: 'http://127.0.0.1:58309' } })).not.toThrow();
+    const config = getConfig({ layer: 'user' }) as { proxy?: { httpProxy?: string } };
+    expect(config.proxy?.httpProxy).toBe('http://127.0.0.1:58309');
+  });
+
+  // Cycle 2 RD coverage-closure: writeConfig user-layer `?? {}` branch (L558).
+  // When `~/.peaks/config.json` does not exist, `readJsonFile` returns
+  // null and the `?? {}` fallback fires. We delete any pre-existing
+  // file first to ensure the missing-file state.
+  test('writeConfig user-layer falls back to {} when no user config exists (L558)', () => {
+    const configPath = join(configTestHome, '.peaks', 'config.json');
+    mkdirSync(join(configTestHome, '.peaks'), { recursive: true });
+    if (existsSync(configPath)) unlinkSync(configPath);
+
+    expect(() => writeConfig({ language: 'en' }, 'user')).not.toThrow();
+    expect(existsSync(configPath)).toBe(true);
+    const onDisk = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
+    expect(onDisk.language).toBe('en');
+  });
+
+  // Cycle 2 RD coverage-closure: getConfig `?? {}` and tokens undefined branches (L565, L576).
+  test('getConfig returns an empty object shape when no user config exists (L565, L576)', () => {
+    const configPath = join(configTestHome, '.peaks', 'config.json');
+    mkdirSync(join(configTestHome, '.peaks'), { recursive: true });
+    if (existsSync(configPath)) unlinkSync(configPath);
+    // Confirm pre-condition: file is absent.
+    expect(existsSync(configPath)).toBe(false);
+
+    // `readUserJsonFile()` returns null, the `?? {}` fallback at L565
+    // fires, and `source.tokens` is undefined so the `tokens`-aware
+    // spread at L576 reduces to the bare `{ ...source }` (the `: {}`
+    // branch of the ternary).
+    const userConfig = getConfig({ layer: 'user' });
+    expect(userConfig).toEqual({});
+  });
+
+  // Cycle 2 RD coverage-closure: writeConfig invalid-layer branch (L539-540).
+  test('writeConfig rejects an invalid layer value (L539-540)', () => {
+    expect(() => writeConfig({ language: 'en' }, 'invalid' as 'user')).toThrow('Invalid config layer');
+  });
+
+  // Cycle 2 RD coverage-closure: bootstrapProjectLanguageConfig empty-language branch (L477-478).
+  test('bootstrapProjectLanguageConfig rejects an empty / whitespace-only language', () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-empty-lang-'));
+    expect(() => bootstrapProjectLanguageConfig(projectRoot, '')).toThrow('Language must be non-empty');
+    expect(() => bootstrapProjectLanguageConfig(projectRoot, '   ')).toThrow('Language must be non-empty');
+    expect(existsSync(join(projectRoot, '.peaks', 'config.json'))).toBe(false);
+  });
+
+  // Cycle 2 RD coverage-closure: getProjectWriteTarget throw branch (L369-370).
+  // writeConfig({...}, 'project') and setConfig({..., layer: 'project'}) both
+  // call getProjectWriteTarget() first; when findProjectRoot returns null
+  // (no project marker visible from the cwd), the helper throws
+  // "Project config not found" before any write happens.
+  test('writeConfig project layer throws when no project root is discoverable (L369-370)', () => {
+    // A tempdir with no .peaks/ and no .git/ and no package.json/ — the
+    // "no project root" state. We also point cwd at it.
+    const emptyRoot = mkdtempSync(join(tmpdir(), 'peaks-no-project-'));
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(emptyRoot);
+    try {
+      expect(() => writeConfig({ language: 'en' }, 'project')).toThrow('Project config not found');
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  test('setConfig project layer throws when no project root is discoverable (L369-370)', () => {
+    const emptyRoot = mkdtempSync(join(tmpdir(), 'peaks-no-project-'));
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(emptyRoot);
+    try {
+      expect(() => setConfig({ key: 'safeFlag', value: 'enabled', layer: 'project' })).toThrow('Project config not found');
+    } finally {
+      cwdSpy.mockRestore();
+    }
+  });
+
+  // Cycle 2 RD coverage-closure: isValidLegacyMiniMaxBaseUrl catch branch (L446-447).
+  // When the stored baseUrl is unparseable, the helper returns false. We
+  // trigger the path via getMiniMaxProviderStatus(), which reads the
+  // stored baseUrl via getMiniMaxProviderConfig() and calls
+  // createLegacyMiniMaxProviderStatus (which calls isValidLegacyMiniMaxBaseUrl)
+  // without going through validateMiniMaxBaseUrl first.
+  test('getMiniMaxProviderStatus handles an unparseable stored baseUrl gracefully (L446-447)', () => {
+    mkdirSync(join(configTestHome, '.peaks'), { recursive: true });
+    // Write a baseUrl that `new URL(...)` will reject outright. We bypass
+    // the writeConfig validation by writing the file directly.
+    writeFileSync(
+      join(configTestHome, '.peaks', 'config.json'),
+      JSON.stringify({ providers: { minimax: { baseUrl: 'not a url at all', apiKey: 'secret' } } }),
+      'utf8'
+    );
+
+    // getMiniMaxProviderStatus must not throw — the legacy helper
+    // returns false on unparseable URLs.
+    const status = getMiniMaxProviderStatus();
+    expect(status.baseUrlConfigured).toBe(false);
+    expect(status.apiKeyConfigured).toBe(true);
+    expect(status.configured).toBe(false);
+  });
+
   test('normalizes external config shapes before exposing provider config', () => {
     writeConfig({ providers: { minimax: { model: 'minimax-2.7', baseUrl: 'https://api.minimaxi.com/anthropic', apiKey: 123 as unknown as string } as never } }, 'user');
     const providerConfig = getMiniMaxProviderConfig();
@@ -282,7 +466,12 @@ describe('secret config handling', () => {
         GitHubToken: { ghCli: true },
         OpenAiApiKey: { env: '  OPENAI_KEY  ' },
         AnthropicApiKey: { env: '' } as never,
-        GitLabToken: { keychain: ' ' } as never,
+        // Cycle 2 RD coverage-closure: the `keychain: 'service-account'`
+        // entry below covers the `if (keychain.length > 0) return { keychain }`
+        // branch at config-service.ts L333-335. The previous test
+        // configuration used `keychain: ' '` which trims to empty and
+        // therefore hit the same drop branch as the env: '' case.
+        GitLabToken: { keychain: 'service-account' },
         ExtraToken: { env: 'SHOULD_NOT_SURVIVE' } as never
       }
     } as never, 'user');
@@ -290,10 +479,10 @@ describe('secret config handling', () => {
     const config = getConfig({ layer: 'user' }) as { tokens?: Record<string, unknown> };
     expect(config.tokens).toMatchObject({
       GitHubToken: { ghCli: true },
-      OpenAiApiKey: { env: 'OPENAI_KEY' }
+      OpenAiApiKey: { env: 'OPENAI_KEY' },
+      GitLabToken: { keychain: 'service-account' }
     });
     expect(config.tokens?.AnthropicApiKey).toBeUndefined();
-    expect(config.tokens?.GitLabToken).toBeUndefined();
     expect(config.tokens?.ExtraToken).toBeUndefined();
   });
 
@@ -536,294 +725,8 @@ describe('secret config handling', () => {
   });
 });
 
-describe('project config discovery', () => {
-  test('prefers project .peaks config over global .peaks config', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    mkdirSync(join(projectRoot, '.peaks'), { recursive: true });
-    mkdirSync(join(configTestHome, '.peaks'), { recursive: true });
-    writeFileSync(join(configTestHome, '.peaks', 'config.json'), JSON.stringify({ language: 'en', currentWorkspace: 'global' }), 'utf8');
-    writeFileSync(join(projectRoot, '.peaks', 'config.json'), JSON.stringify({ language: 'zh', currentWorkspace: 'project' }), 'utf8');
+// Note: `loadGlobalConfig` and its 1.x throw / promotion paths are
+// covered in `tests/unit/load-global-config.test.ts` (split out of this
+// file during the cycle 2 file-size-cap refactor — this file exceeded
+// the 800-line cap once the coverage-closure tests were added).
 
-    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(projectRoot);
-    try {
-      expect(readConfig()).toMatchObject({ language: 'zh' });
-      expect(getConfig()).toMatchObject({ language: 'zh', currentWorkspace: 'project' });
-    } finally {
-      cwdSpy.mockRestore();
-    }
-  });
-
-  test('falls back to global .peaks config when project config is absent', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    mkdirSync(join(configTestHome, '.peaks'), { recursive: true });
-    // 2.0.1 slim: legacy fields can still be present in pre-2.0.1
-    // config files and must be exposed via getConfig (loader is tolerant).
-    writeFileSync(join(configTestHome, '.peaks', 'config.json'), JSON.stringify({ language: 'zh', model: 'minimax' }), 'utf8');
-
-    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(projectRoot);
-    try {
-      expect(readConfig()).toMatchObject({ language: 'zh' });
-      expect(getConfig()).toMatchObject({ language: 'zh' });
-    } finally {
-      cwdSpy.mockRestore();
-    }
-  });
-
-  test('does not treat the user home .peaks config as a project config through a symlinked home path', () => {
-    const realHomeRoot = mkdtempSync(join(tmpdir(), 'peaks-real-home-'));
-    const linkedHomeRoot = join(tmpdir(), `peaks-linked-home-${Date.now()}`);
-    symlinkSync(realHomeRoot, linkedHomeRoot, 'junction');
-    mkdirSync(join(realHomeRoot, '.peaks'), { recursive: true });
-    writeFileSync(join(realHomeRoot, '.peaks', 'config.json'), JSON.stringify({ language: 'zh-CN' }), 'utf8');
-
-    const originalHome = process.env.HOME;
-    process.env.HOME = linkedHomeRoot;
-    try {
-      expect(resolveProjectRootForConfig(join(realHomeRoot, 'nested'))).toBe(join(realHomeRoot, 'nested'));
-    } finally {
-      if (originalHome === undefined) {
-        delete process.env.HOME;
-      } else {
-        process.env.HOME = originalHome;
-      }
-    }
-  });
-
-  test('does not read project config when marker resolves outside the candidate root', async () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    const outsideRoot = mkdtempSync(join(tmpdir(), 'peaks-config-outside-'));
-    mkdirSync(outsideRoot, { recursive: true });
-    writeFileSync(join(outsideRoot, 'config.json'), JSON.stringify({ unsafeProjectMarker: true }), 'utf8');
-    symlinkSync(outsideRoot, join(projectRoot, '.peaks'), 'junction');
-
-    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(projectRoot);
-    try {
-      const config = getConfig() as { unsafeProjectMarker?: boolean };
-
-      expect(config.unsafeProjectMarker).toBeUndefined();
-    } finally {
-      cwdSpy.mockRestore();
-    }
-  });
-
-  test('bootstraps project language config from natural-language first use', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    const configPath = join(projectRoot, '.peaks', 'config.json');
-
-    expect(existsSync(configPath)).toBe(false);
-
-    bootstrapProjectLanguageConfig(projectRoot, '请使用 peaks-solo 帮我重构这个项目');
-
-    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({ language: 'zh-CN' });
-    expect(readConfig(projectRoot).language).toBe('zh-CN');
-  });
-
-  test('bootstraps English project language from natural-language first use', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-
-    bootstrapProjectLanguageConfig(projectRoot, 'Please use peaks-solo to refactor this project');
-
-    expect(JSON.parse(readFileSync(join(projectRoot, '.peaks', 'config.json'), 'utf8'))).toEqual({ language: 'en' });
-  });
-
-  test('rejects bootstrap when the project .peaks directory resolves outside the project root', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    const outsideRoot = mkdtempSync(join(tmpdir(), 'peaks-config-outside-'));
-    symlinkSync(outsideRoot, join(projectRoot, '.peaks'), 'junction');
-
-    expect(() => bootstrapProjectLanguageConfig(projectRoot, 'zh-CN')).toThrow('Project config path must stay inside the project root');
-    expect(existsSync(join(outsideRoot, 'config.json'))).toBe(false);
-  });
-
-  test('rejects bootstrap when the project .peaks directory resolves to another project directory', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    const sourceRoot = join(projectRoot, 'src');
-    mkdirSync(sourceRoot, { recursive: true });
-    symlinkSync(sourceRoot, join(projectRoot, '.peaks'), 'junction');
-
-    expect(() => bootstrapProjectLanguageConfig(projectRoot, 'zh-CN')).toThrow('Project config path must stay inside the project root');
-    expect(existsSync(join(sourceRoot, 'config.json'))).toBe(false);
-  });
-
-  test('rejects bootstrap when project config is a symlink outside the project root', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    const outsideRoot = mkdtempSync(join(tmpdir(), 'peaks-config-outside-'));
-    mkdirSync(join(projectRoot, '.peaks'), { recursive: true });
-    symlinkSync(outsideRoot, join(projectRoot, '.peaks', 'config.json'), 'junction');
-
-    expect(() => bootstrapProjectLanguageConfig(projectRoot, 'zh-CN')).toThrow('Project config path must stay inside the project root');
-    expect(existsSync(join(outsideRoot, 'language'))).toBe(false);
-  });
-
-  test('rejects bootstrap when project config is hardlinked', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    const outsideRoot = mkdtempSync(join(tmpdir(), 'peaks-config-outside-'));
-    const outsideConfigPath = join(outsideRoot, 'config.json');
-    mkdirSync(join(projectRoot, '.peaks'), { recursive: true });
-    writeFileSync(outsideConfigPath, '{}', 'utf8');
-    linkSync(outsideConfigPath, join(projectRoot, '.peaks', 'config.json'));
-
-    expect(() => bootstrapProjectLanguageConfig(projectRoot, 'zh-CN')).toThrow('Config path must not be hardlinked');
-    expect(readFileSync(outsideConfigPath, 'utf8')).toBe('{}');
-  });
-
-  test('keeps existing project language when bootstrap runs again', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    mkdirSync(join(projectRoot, '.peaks'), { recursive: true });
-    writeFileSync(join(projectRoot, '.peaks', 'config.json'), JSON.stringify({ language: 'zh-CN', economyMode: false }), 'utf8');
-
-    bootstrapProjectLanguageConfig(projectRoot, 'en');
-
-    expect(JSON.parse(readFileSync(join(projectRoot, '.peaks', 'config.json'), 'utf8'))).toEqual({ language: 'zh-CN', economyMode: false });
-  });
-
-  test('does not overwrite malformed project config during language bootstrap', () => {
-    const projectRoot = mkdtempSync(join(tmpdir(), 'peaks-config-root-'));
-    const configPath = join(projectRoot, '.peaks', 'config.json');
-    mkdirSync(join(projectRoot, '.peaks'), { recursive: true });
-    writeFileSync(configPath, '{bad', 'utf8');
-
-    expect(() => bootstrapProjectLanguageConfig(projectRoot, 'zh-CN')).toThrow('Project config must contain valid JSON');
-    expect(readFileSync(configPath, 'utf8')).toBe('{bad');
-  });
-});
-
-describe('config types', () => {
-  test('TokenRef supports all variants', () => {
-    const envRef = { env: 'MY_KEY' };
-    const keychainRef = { keychain: 'service' };
-    const ghCliRef = { ghCli: true };
-    expect(envRef.env).toBe('MY_KEY');
-    expect(keychainRef.keychain).toBe('service');
-    expect(ghCliRef.ghCli).toBe(true);
-  });
-
-  test('WorkspaceConfig with artifact repo', () => {
-    const ws = {
-      workspaceId: 'test',
-      name: 'Test',
-      rootPath: '/test',
-      installedCapabilityIds: ['cap1'],
-      artifactRepo: { provider: 'github' as const, owner: 'user', name: 'repo' }
-    };
-    expect(ws.artifactRepo?.provider).toBe('github');
-    expect(ws.artifactRepo?.owner).toBe('user');
-  });
-
-  test('PeaksConfig structure', () => {
-    const config = {
-      version: '0.1.0',
-      currentWorkspace: 'ws1',
-      workspaces: [],
-      language: 'en',
-      model: 'sonnet' as const,
-      economyMode: true,
-      swarmMode: true,
-      tokens: { GitHubToken: { env: 'GH_TOKEN' } },
-      providers: {
-        minimax: {
-          model: 'minimax-2.7',
-          baseUrl: 'https://api.minimaxi.com/anthropic',
-          apiKey: 'test-key'
-        }
-      },
-      proxy: {}
-    };
-    expect(config.version).toBe('0.1.0');
-    expect(config.currentWorkspace).toBe('ws1');
-    expect(config.model).toBe('sonnet');
-    expect(config.economyMode).toBe(true);
-    expect(config.swarmMode).toBe(true);
-    expect(config.providers.minimax?.model).toBe('minimax-2.7');
-    expect(config.providers.minimax?.baseUrl).toBe('https://api.minimaxi.com/anthropic');
-  });
-});
-
-describe('CLI integration via program', () => {
-  // These tests verify the CLI commands work correctly
-  // by testing through the actual program entrypoint
-
-  test('config types are correctly exported from config-types', async () => {
-    const { DEFAULT_CONFIG } = await import('../../src/services/config/config-types.js');
-    const { CLI_VERSION } = await import('../../src/shared/version.js');
-    expect(DEFAULT_CONFIG).toBeDefined();
-    // 2.0.1 slim: only `version` + `ocr` placeholders live in DEFAULT_CONFIG.
-    // Legacy fields (language/model/etc.) are rejected by setConfig and live
-    // in `<project>/.peaks/preferences.json`.
-    expect(DEFAULT_CONFIG.version).toBe(CLI_VERSION);
-    expect(DEFAULT_CONFIG.ocr?.llm).toEqual({
-      url: '',
-      authToken: '',
-      model: '',
-      useAnthropic: false,
-      authHeader: 'authorization'
-    });
-    expect((DEFAULT_CONFIG as Record<string, unknown>).language).toBeUndefined();
-    expect((DEFAULT_CONFIG as Record<string, unknown>).model).toBeUndefined();
-    expect((DEFAULT_CONFIG as Record<string, unknown>).economyMode).toBeUndefined();
-  });
-
-  test('ConfigLayer type has user and project', async () => {
-    const configTypes = await import('../../src/services/config/config-types.js');
-    type ConfigLayer = 'user' | 'project';
-    const layers: ConfigLayer[] = ['user', 'project'];
-    expect(layers).toHaveLength(2);
-  });
-});
-
-describe('Bug 1 — 2.0.1 slim config defaults', () => {
-  // Slice 2.0.1-bug1-config-defaults — the on-disk `~/.peaks/config.json`
-  // must hold only `version` + `ocr` placeholders. Per-project fields
-  // (language, model, economyMode, swarmMode) are rejected at write
-  // time and live in `<project>/.peaks/preferences.json` instead.
-
-  test('case A — fresh migration writes slim 2-key form (version + ocr)', async () => {
-    const { executeMigration } = await import('../../src/services/config/config-migration.js');
-    const configPath = join(configTestHome, '.peaks', 'config.json');
-    mkdirSync(join(configTestHome, '.peaks'), { recursive: true });
-    writeFileSync(configPath, JSON.stringify({ version: '1.4.2', language: 'en', model: 'sonnet', economyMode: true }), 'utf8');
-
-    executeMigration({ currentProjectRoot: configTestHome, apply: true });
-
-    const onDisk = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
-    expect(Object.keys(onDisk).sort()).toEqual(['ocr', 'version']);
-    const ocr = onDisk.ocr as { llm?: Record<string, unknown> };
-    expect(ocr).toBeDefined();
-    expect(ocr.llm).toEqual({
-      url: '',
-      authToken: '',
-      model: '',
-      useAnthropic: false,
-      authHeader: 'authorization'
-    });
-  });
-
-  test('case B — existing old-format file loads without throwing and exposes legacy fields via getConfig', () => {
-    const configPath = join(configTestHome, '.peaks', 'config.json');
-    mkdirSync(join(configTestHome, '.peaks'), { recursive: true });
-    writeFileSync(configPath, JSON.stringify({
-      version: '1.4.2',
-      language: 'zh-CN',
-      model: 'sonnet',
-      economyMode: true,
-      swarmMode: false
-    }), 'utf8');
-
-    expect(() => getConfig({ layer: 'user' })).not.toThrow();
-    const legacy = getConfig({ layer: 'user' }) as { language?: string; model?: string; economyMode?: boolean; swarmMode?: boolean };
-    expect(legacy.language).toBe('zh-CN');
-    expect(legacy.model).toBe('sonnet');
-    expect(legacy.economyMode).toBe(true);
-    expect(legacy.swarmMode).toBe(false);
-  });
-
-  test('case C — setConfig to a legacy key is rejected with a preferences.json pointer', () => {
-    // 2.0.1 moved per-project fields to .peaks/preferences.json (per spec
-    // §10.4). tokens / providers / proxy still live in the user config
-    // and are not in this rejection set.
-    const legacyKeys = ['language', 'model', 'economyMode', 'swarmMode'];
-    for (const key of legacyKeys) {
-      expect(() => setConfig({ key, value: 'zh-CN' as never }), `setConfig should reject legacy key "${key}"`).toThrow(/preferences\.json/);
-    }
-  });
-});

@@ -181,3 +181,24 @@ export function setProviderConfig(providerId: string, input: ProviderModelConfig
   saveProvidersSidecar(next);
   return next;
 }
+
+export function isProviderConfigPath(path: string): boolean {
+  return path === 'providers' || path.startsWith('providers.');
+}
+
+export function isProviderBaseUrlPath(path: string): boolean {
+  return /^providers\.[^.]+\.baseUrl$/.test(path);
+}
+
+export function getMiniMaxBaseUrlCandidate(key: string, value: unknown): unknown {
+  if (key === 'providers.minimax.baseUrl') {
+    return value;
+  }
+  if (key === 'providers.minimax' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return (value as Partial<MiniMaxProviderConfig>).baseUrl;
+  }
+  if (key === 'providers' && value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return (value as Partial<ModelProviderConfig>).minimax?.baseUrl;
+  }
+  return undefined;
+}

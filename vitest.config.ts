@@ -68,10 +68,21 @@ export default defineConfig({
         'src/services/recommendations/recommendation-types.ts',
         'src/services/artifacts/artifact-service.ts',
         'src/services/artifacts/workspace-service.ts',
+        // 2.10.0 carve-out: these 2 files were split per slice 008-p0-file-size-cap-refactor.
+        // `config-service.ts` stays at 94.75% branches due to 13 documented uncovered branches
+        // (L136/L160/L173-174/L195/L257/L316/L327/L343/L356/L460/L471/L550/L617 — defensive paths
+        // in `readJsonFile` / `getNestedValue` / `setNestedValue` / `getConfig` non-object path /
+        // proxy / OCR / miniMax validation). Full investigation in
+        // `.peaks/_runtime/2026-06-25-session-fe94e7/rd/requests/N5-cycle-3-v8-quirk-refactor.md`
+        // and `N6-cycle-4-non-object-test.md`. Follow-up slice queued.
         'src/services/config/config-service.ts',
         'src/services/config/config-safety.ts',
         'src/shared/frontmatter.ts',
         'src/services/skills/skill-registry.ts',
+        // 2.10.0 carve-out: `doctor-service.ts` split per slice 008. Public API preserved via
+        // re-exports in `doctor-service.ts`. Sibling files (`doctor-probes.ts` etc.) are NOT in
+        // this carve-out — they're measured by coverage and pass the 100% threshold via the
+        // existing `runDoctor` test surface.
         'src/services/doctor/doctor-service.ts',
         'src/services/proxy/proxy-service.ts',
         'src/services/codegraph/codegraph-process-runner.ts',
