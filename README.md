@@ -1,3 +1,20 @@
+<!-- ARCHIVE NOTICE -->
+
+> ⚠️ **本仓库已归档（read-only）。**
+>
+> `peaks-cli` 不再在此维护。**所有后续开发、bug 修复、新功能请移步新仓库 →** **[SquabbyZ/peaks-loop](https://github.com/SquabbyZ/peaks-loop)**。
+>
+> 安装命令：
+> ```bash
+> # 新仓库（新版本、新功能）：包名仍是 peaks-cli，但发布源已切到 peaks-loop
+> npm install -g peaks-cli
+> ```
+>
+> 本仓库作为 **v2.19.0** 的历史快照保留。Issues / PR / Discussions 已全部关闭。
+> 详细迁移说明见下方「[🪦 为什么归档](#-为什么归档)」一节。
+
+<!-- /ARCHIVE NOTICE -->
+
 <div align="center">
 
 # ⛰️ Peaks
@@ -328,6 +345,18 @@ peaks gate bypass --sop <id> --phase <phase> --reason "<why>"
 ```
 
 下次匹配的 Bash 命令放行一次（每个 SOP 每项目上限 3 次）。完整文档：[`.claude/HOOKS.md`](./.claude/HOOKS.md)。
+
+## 🪦 为什么归档
+
+`peaks-cli` 的开发已迁移到新仓库 **[SquabbyZ/peaks-loop](https://github.com/SquabbyZ/peaks-loop)**。
+
+- **新仓库**：[`SquabbyZ/peaks-loop`](https://github.com/SquabbyZ/peaks-loop) — 所有后续 issue、PR、release 在这里进行。
+- **npm 包名不变**：仍然是 `peaks-cli`；新版本会从 peaks-loop 发布到 npm registry。
+- **本仓库的最终版本**：`v2.19.0`（2026-07 发布）。不会再有新的 release。
+- **已知问题 / 后续规划**：请去 [`SquabbyZ/peaks-loop/issues`](https://github.com/SquabbyZ/peaks-loop/issues) 查看和提报。
+- **本仓库保留全部文档与历史 commit** 作为参考快照；旧的 stars / forks / wiki 不受影响，但不会再被维护。
+
+如果你是新用户，**直接去 [SquabbyZ/peaks-loop](https://github.com/SquabbyZ/peaks-loop)** 看 README；如果你是老用户想升级，最快的路径是 `npm install -g peaks-cli@latest` 拉到 peaks-loop 发布的最新版本。
 
 ## 🏗️ 项目状态
 

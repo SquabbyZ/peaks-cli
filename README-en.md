@@ -1,3 +1,21 @@
+<!-- ARCHIVE NOTICE -->
+
+> ⚠️ **This repository has been archived (read-only).**
+>
+> `peaks-cli` is no longer maintained here. **All ongoing development, bug fixes, and new features have moved to** **[SquabbyZ/peaks-loop](https://github.com/SquabbyZ/peaks-loop)**.
+>
+> Install:
+> ```bash
+> # New repo (new versions, new features): the npm package name is still peaks-cli,
+> # but the publish source has moved to peaks-loop.
+> npm install -g peaks-cli
+> ```
+>
+> This repo is preserved as a **v2.19.0** historical snapshot. Issues / PRs / Discussions are all closed.
+> See the [🪦 Why archived](#-why-archived) section below for the migration story.
+
+<!-- /ARCHIVE NOTICE -->
+
 <div align="center">
 
 # ⛰️ Peaks
@@ -244,6 +262,18 @@ Full list: `peaks --help`.
 | ✅ **Claude Code** | 13 skills + PreToolUse hook, agent team dogfooded |
 | ⚠️ **Trae** | slim `IdeAdapter` registered, real-Trae dogfood is a follow-up slice |
 | 📋 **Codex / Cursor / Qoder / Tongyi Lingma, and more** | On the roadmap |
+
+## 🪦 Why archived
+
+Development of `peaks-cli` has moved to **[SquabbyZ/peaks-loop](https://github.com/SquabbyZ/peaks-loop)**.
+
+- **New repo**: [`SquabbyZ/peaks-loop`](https://github.com/SquabbyZ/peaks-loop) — all future issues, PRs, and releases happen there.
+- **npm package name unchanged**: still `peaks-cli`; new versions will publish from `peaks-loop` to the npm registry.
+- **Final version released from this repo**: `v2.19.0` (July 2026). No further releases will be cut here.
+- **Known issues / roadmap**: see [`SquabbyZ/peaks-loop/issues`](https://github.com/SquabbyZ/peaks-loop/issues).
+- **Docs and history are preserved here** as a reference snapshot; existing stars / forks / wiki are unchanged but will no longer be maintained.
+
+If you're a new user, **head straight to [SquabbyZ/peaks-loop](https://github.com/SquabbyZ/peaks-loop)** for the current README. If you're an existing user and want to upgrade, the fastest path is `npm install -g peaks-cli@latest` to pull the newest release published from `peaks-loop`.
 
 ## 🏗️ Project status
 
